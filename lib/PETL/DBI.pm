@@ -31,13 +31,17 @@ sub statement {
 	    $v->add_row( $row );
 	  }
 
-	} finally {
+	} catch {
 
-	  # always mark the result set as finished
-	  $sth->finish();
+	  my $e = $_;
+	  
+	  #  mark the result set as finished if exception thrown
+	  # then propagate the exception
+	  push @DB::typeahead, 'x $e';
+	  $DB::single = 1;
+	  die $e if defined $e;
 
 	};
-
       }
     );
 }

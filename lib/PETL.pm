@@ -2,13 +2,16 @@ package PETL;
 use 5.10.0;
 use strict;
 use warnings;
+no warnings qw(uninitialized);
 
 use Class::Multimethods qw	(multimethod)	;
 use ColumnIndex					;
+use DBI                         ()              ;
 use Exporter            qw	(import)	;
 use GenericViewer				;
 use IO::File            qw	()		;
 use List::Util          qw	()		;
+use PETL::DBI           qw      ()              ;
 use Publisher					;
 use Symbol			()		;
 use Sub::Name			()		;
@@ -39,8 +42,10 @@ our @EXPORT_OK =
       late
       loh
       lol
+      long
       perform
       range
+      regex
       show
       table
 
@@ -61,7 +66,7 @@ our %EXPORT_TAGS =
 #
 {
   # temporarily suppress 'only used once' messages
-  no warnings;
+  no warnings 'once';
   @Code::ISA  = 'CODE';
   @Array::ISA = 'ARRAY';
   @Hash::ISA  = 'HASH';
@@ -269,42 +274,88 @@ multimethod dbh => qw(DBI::db CODE) => sub {
 
 # dbh query using static query and arguments
 multimethod dbh => qw( DBI::db  $ ARRAY ) => sub {
-  my ($dbh, $sql, $ra_arg_names) = @_;
+  # use database handle as inner part of cartesian product with argument names
+  my DBI::db $dbh		= shift;
+  my         $sql		= shift;
+  my Array   $ra_arg_names	= shift;
 
-  my $sth = $dbh->prepare( $sql );
   my @arg_names = @$ra_arg_names;
   my $num_args = scalar @arg_names;
   return _simple
     ( sub {
 	my GenericViewer $viewer = shift;
 
-	my $rows = $sth->execute( @_{@arg_names} );
+	# throw exception if default hash doesn't have columns requested in the array
+	my @missing = grep !exists $_{$_}, @arg_names;
+	die "Requested columns ( @missing ) aren't present in outer context.\n"
+	  if @missing;
+
+	my DBI::st $sth  = $dbh->prepare_cached( $sql );
+	my         $rows = $sth->execute( @_{@arg_names} );
 	return unless $rows;
 
-	$viewer->add_header([ @{$sth->{'NAME'}} ]);
-	while ( my $row = $sth->fetchrow_arrayref() ) {
-	  $viewer->add_row( $row );
-	}
+	# transfer statement to viewer
+	_BREAK_HERE_;
+	PETL::DBI::statement( $sth )->( $viewer );
       });
 };
+
+sub _appender {
+  # Accept an array of headers for left-most cells, and the row values
+  # for those same cells, and a downstream viewer.  Return a viewer
+  # that places the left header cells before the header received from
+  # the publisher, and the left cells before the cells received from
+  # the publisher
+  my ( $left_headers, $left_cells, $viewer ) = @_;
+
+  return viewer
+    (
+     on_header => sub {
+       my ($ig, $header) = @_;
+       $viewer->add_header([ @$left_headers, @$header ]);
+     },
+     on_row    => sub {
+       my ($ig, $row   ) = @_;
+       $viewer->add_row   ([ @$left_cells  , @$row    ]);
+     },
+    );
+}
 
 # dbh query, usually insert or update, returns publisher that shows
 # number of records returned from the execute
 multimethod dbh => qw( DBI::db $ Publisher ) => sub {
   my ( $dbh, $sql, $pub ) = @_;
 
+  # determine if query is from a SELECT statement and prepare the
+  # query
+  my $is_select = $sql =~ /^\s*SELECT\b/i;
   my $sth = $dbh->prepare_cached( $sql );
+
+  # flag to indicate whether we've sent the header or not
+  my $has_header = FALSE;
+
   return _pub
     (
      publisher => $pub,
-     on_header => sub {
-       my ($v, $headers) = @_;
-       $v->add_header([ rows => @$headers ]);
-     },
+     on_header => sub {},
      on_row    => sub {
        my ($v, $row) = @_;
        my $num_rows = $sth->execute( @$row );
-       $v->add_row([ $num_rows + 0, @$row ]);
+       $num_rows += 0;
+
+       if ( $is_select ) {
+	 $DB::single = 1;
+	 PETL::DBI::statement( $sth )
+	     ->( _appender( ['rows'], [$num_rows], $v ) );
+       } 
+       else {
+	 unless( $has_header ) {
+	   $v->add_header([ 'rows' ]);
+	   $has_header = TRUE;
+	 }
+	 $v->add_row([ $num_rows ]);
+       }
+
      },
     );
 };
@@ -861,6 +912,36 @@ multimethod lol => ('ARRAY') => sub {
 };
 
 ########################################
+# LONG keyword
+########################################
+# 'long' format shows one column per row and rows seperated by blank line
+multimethod long => ('Publisher') => sub {
+  my Publisher $pub = shift;
+
+  my $format;
+  my @header;
+  return publisher
+    (
+     publisher => $pub,
+     on_header => sub {
+       my ($v, $header) = @_;
+       @header = @$header;
+
+       $format = '%' . List::Util::max( map length, @header ) . 's: %s';
+       $v->add_header([ 'result' ]);
+     },
+     on_row    => sub {
+       my ($v, $row   ) = @_;
+
+       for my $column_index ( 0 .. $#header ) {
+	 $v->add_row([ sprintf( $format, $header[$column_index], $row->[$column_index] ) ]);
+       }
+       $v->add_row([ '' ]);
+     },
+    );
+};
+
+########################################
 # PERFORM keyword
 ########################################
 # 'perform' function
@@ -900,6 +981,47 @@ multimethod range => ('#', '#') => sub {
 	}
       }
     );
+};
+
+########################################
+# REGEX keyword
+########################################
+# accept a regex and a publisher, return publisher of captures found
+# by regex in first column of input publisher
+multimethod regex => qw(Regexp Publisher) => sub {
+  my Regexp    $regex = shift;
+  my Publisher $pub   = shift;
+
+  my Code $cb;
+  my $has_header = 0;
+  return publisher
+    (
+     publisher => $pub,
+     on_header => sub {
+     },
+     on_row    => sub {
+       my GenericViewer $v      = shift;
+       my Array         $row    = shift;
+
+       my Array $cells = [ $row->[0] =~ /$regex/ ];
+
+       unless ( $has_header ) {
+	 # add a default header
+	 $has_header++;
+	 $v->add_header([ map sprintf( 'field%03d', $_ ), 0..$#$cells ]);
+       }
+      
+       # send the captured sells as a row
+       $v->add_row( $cells );
+     },
+    );
+};
+
+# regex with string and publisher
+multimethod regex => qw($ Publisher) => sub {
+  my $regexp        = shift;
+  my Publisher $pub = shift;
+  return regex( qr/$regexp/, $pub );
 };
 
 ########################################
@@ -967,7 +1089,7 @@ sub _BREAK_HERE_ {
   # allow persistent debugger commands and breaks
   return unless IN_DEBUGGER;
 
-  no warnings;
+  no warnings 'once';
   push @DB::typeahead, @_;
   $DB::single = 1 
 }
@@ -982,19 +1104,6 @@ sub _pub { Publisher->new( @_ ) }
 sub _simple { Publisher::Simple->new( @_ ) }
 
 no Exporter;
-
-
-# perform
-#   (
-#    table
-#    (
-#     [
-#      [ 'A'..'C' ],
-#      [   1..  3 ],
-#      [   4..  6 ],
-#     ]
-#    )
-#   );
 
 return __PACKAGE__;
 
