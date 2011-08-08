@@ -5,7 +5,7 @@ use warnings;
 use DBI                  ();
 use Exporter         qw  (import);
 use GenericViewer        ();
-use Try::Tiny            ();
+use Try::Tiny        qw  (try catch finally);
 use Publisher            ();
 
 our @ISA = qw( Publisher );
@@ -16,7 +16,7 @@ our @EXPORT_OK = qw(
 
 sub statement {
   # Accept DBI::st, return publisher over DBI::st results
-  my DBI::st  $sth    = shift;
+    my DBI::st  $sth    = shift;
 
   return Publisher::Simple->new
     ( sub {
@@ -34,14 +34,19 @@ sub statement {
 	} catch {
 
 	  my $e = $_;
-	  
+
 	  #  mark the result set as finished if exception thrown
 	  # then propagate the exception
 	  push @DB::typeahead, 'x $e';
 	  $DB::single = 1;
 	  die $e if defined $e;
 
-	};
+	} finally {
+
+            # clear the reference to the statement handle
+            $sth = undef;
+
+        };
       }
     );
 }
