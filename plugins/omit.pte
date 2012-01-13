@@ -1,0 +1,47 @@
+# perl
+use PETL qw(:all);
+use Class::Multimethods;
+
+# OMIT keyword - pass all fields -except- those in the list
+multimethod omit => qw(ARRAY Publisher) => sub {
+    my $ra_fields     = shift;
+    my Publisher $pub = shift;
+
+    publisher sub {
+        my GenericViewer $v = shift;
+
+        my $ci = ColumnIndex->new;
+        my $cb = $ci->get_omit_cb( @$ra_fields );
+        my $pub = publisher
+            (
+                publisher => $pub,
+                on_header => sub {
+                    my ($gv, $cells) = @_;
+                    $ci->add_header( $cells );
+                    $gv->add_header([ $cb->( $cells ) ]);
+                },
+                on_row    => sub {
+                    my ($gv, $cells) = @_;
+                    $gv->add_row([ $cb->( $cells ) ]);
+                },
+            );
+        $pub->( $v );
+    };
+};
+
+multimethod omit => qw($ Publisher) => sub {
+    my $fields        = shift;
+    my Publisher $pub = shift;
+
+    omit( [split( ' ', $fields )], $pub );
+};
+
+multimethod omit => qw(CODE Publisher) => sub {
+    my $late          = shift;
+    my Publisher $pub = shift;
+
+    publisher sub {
+        my GenericViewer $v = shift;
+        omit( &$late, $pub )->( $v );
+    };
+};     

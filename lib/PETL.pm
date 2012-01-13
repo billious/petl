@@ -7,10 +7,12 @@ no warnings qw(uninitialized);
 use Class::Multimethods qw	(multimethod)	;
 use ColumnIndex					;
 use DBI                         ()              ;
-use Exporter            qw	(import)	;
+use Exporter            qw      (import)        ;
+use File::Spec                  ()              ;
 use GenericViewer				;
 use IO::File            qw	()		;
 use List::Util          qw	()		;
+use PETL::Connector     qw      (connector)     ;
 use PETL::DBI           qw      ()              ;
 use Publisher					;
 use Symbol			()		;
@@ -25,10 +27,13 @@ our @EXPORT_OK =
   qw(
       aa
       auto_aligned
+      auto_named
       cache
       chomped
       choose
+      cleave
       column
+      columns
       db
       dbh
       define
@@ -37,7 +42,9 @@ our @EXPORT_OK =
       expose
       fields
       file
+      filter
       glue
+      go
       hol
       late
       loh
@@ -48,7 +55,9 @@ our @EXPORT_OK =
       regex
       show
       table
+      union
 
+      connector
       viewer
       publisher
    );
@@ -67,9 +76,10 @@ our %EXPORT_TAGS =
 {
   # temporarily suppress 'only used once' messages
   no warnings 'once';
-  @Code::ISA  = 'CODE';
-  @Array::ISA = 'ARRAY';
-  @Hash::ISA  = 'HASH';
+  @Code::ISA      = 'CODE';
+  @Array::ISA     = 'ARRAY';
+  @Hash::ISA      = 'HASH';
+  @Connector::ISA = 'CODE';
 }
   
 ##############################################################################
@@ -79,61 +89,76 @@ use constant IN_DEBUGGER => DB->can('DB');
 use constant FALSE       => 0;
 use constant TRUE        => ! FALSE;
 
+use constant NO_HANDLER  => sub {};
+
 ##############################################################################
 # SUBROUTINES
 ##############################################################################
 sub _BREAK_HERE_;
+sub auto_named;
+sub publisher;
+# sub viewer;
+sub _timeit;
 
 ########################################
 # AUTO_ALIGNED keyword
 ########################################
-multimethod auto_aligned => ('Publisher') => sub {
-  # accept publisher and return publisher that automatically aligns
-  # columns by width
-  my ($pub) = @_;
+multimethod auto_aligned => qw( Publisher ) => sub {
+    # accept publisher and return publisher that automatically aligns
+    # columns by width
+    my ($pub) = @_;
 
-  my $cb = sub {
-       my GenericViewer $viewer = shift;
+    return publisher
+        ( sub {
+              my GenericViewer $viewer = shift;
 
-       my @widths;
-       my $res = cache( $pub );
+              my @widths;
+              my $res = cache( $pub );
 
-       # get the column widths
-       my $scanner = sub {
-       	 my ($ig, $cells) = @_;
-	 @widths = (0) x @$cells unless @widths;
-       	 for my $idx ( 0 .. $#$cells ) {
-       	   $widths[$idx] = List::Util::max
-       	     ( $widths[$idx], length( $cells->[$idx] ) );
-       	 }
-       };
-       $res->( _gv( on_header => $scanner, on_row => $scanner ) );
+              # get the column widths
+              my $scanner = sub {
+                  my ($ig, $cells) = @_;
+                  @widths = (0) x @$cells 
+                      unless @widths;
+                  for my $idx ( 0 .. $#$cells ) {
+                      $widths[$idx] = List::Util::max
+                          ( $widths[$idx], length( $cells->[$idx] ) );
+                  }
+              };
+              $res->( viewer( on_header => $scanner, on_row => $scanner ) );
 
-       # create the sprintf format string
-       my $format = join ' ', map( "\%-${_}s", @widths ) ;
+              # create the sprintf format string
+              my $format = join ' ', map( "\%-${_}s", @widths ) ;
 
-       # how table is constructed with the format
-       my $out = _pub
-	 ( publisher => $res,
-	   on_header => sub {
-	     my ($v, $header) = @_;
-	     # format column names
-	     $v->add_header([ sprintf( $format, @$header ) ]);
+              # how table is constructed with the format
+              my $row_count = 0;
+              my $out = publisher
+                  ( publisher => $res,
+                    on_header => sub {
+                        my ($v, $header) = @_;
+                        # format column names
+                        $v->add_header([ sprintf( $format, @$header ) ]);
 
-	     # make a formatted seperator row as first row
-	     my @under = map '='x$_, @widths;
-	     $v->add_row([ sprintf( $format, @under ) ]);
-	   },
-	   on_row    => sub {
-	     my ($v, $row) = @_;
-	     $v->add_row([ sprintf( $format, @$row ) ]);
-	   }, );
+                        # make a formatted seperator row as first row
+                        my @under = map '='x$_, @widths;
+                        $v->add_row([ sprintf( $format, @under ) ]);
+                    },
+                    on_row    => sub {
+                        my ($v, $row) = @_;
+                        $row_count++;
+                        $v->add_row([ sprintf( $format, @$row ) ]);
+                    }, 
+                    on_end   => sub {
+                        my GenericViewer $v = shift;
+              
+                        $v->add_row([ $_ ]) for ( '', "Rows received: $row_count" );
+                    },
+                );
 
-       # transfer table from cache through formatter to topmost viewer
-       $out->( $viewer );
-     };
-
-  return _simple( $cb );
+              # transfer table from cache through formatter to topmost viewer
+              $out->( $viewer );
+          }
+      );
 };
 
 # aa is a synonym for auto_aligned
@@ -148,7 +173,7 @@ multimethod cache => ('Publisher') => sub {
   my Publisher $pub = shift;
 
   my $lol;
-  return _simple
+  return publisher
     (sub {
        my GenericViewer $viewer = shift;
 
@@ -172,9 +197,9 @@ multimethod chomped => qw(Publisher) => sub {
     (
      publisher => $pub,
      on_row    => sub {
-       my GenericViewer $v;
-       my $row;
-       ($v, $row) = @_;
+       my GenericViewer $v   = shift;
+       my               $row = shift;
+
        chomp $row->[0];
        $v->add_row([ $row->[0] ]);
      },
@@ -190,7 +215,7 @@ multimethod choose => qw(ARRAY Publisher) => sub {
   my Publisher $pub	= shift;
 
   # use a new ColumnIndex object to generate a callback to retrieve
-  # the requested columns or throw exception
+  # the requested columns or throw exception. 
   my ColumnIndex $cm = ColumnIndex->new();
   my $cb = $cm->get_cb( @$ra_columns );
 
@@ -215,13 +240,14 @@ multimethod choose => qw($ Publisher) => sub {
   return choose( [split ' ', $columns_string], $pub );
 };
 
+
 ########################################
 # COLUMN keyword
 ########################################
 # column with a name and list reference is a one column table
 multimethod column => qw($ ARRAY) => sub {
   my ($column_name, $ra_values) = @_;
-  return _pub
+  return publisher
     (
      on_start => sub {
        my ($v) = @_;
@@ -231,6 +257,35 @@ multimethod column => qw($ ARRAY) => sub {
        }
      },
     );
+};
+
+########################################
+# COLUMNS keyword
+########################################
+# choose column(s) by index instead of 
+# name
+multimethod columns => qw(ARRAY Publisher) => sub {
+    my Array     $indexes = shift;
+    my Publisher $pub     = shift;
+
+    # return the publisher
+    return publisher
+        (
+            publisher => $pub,
+
+            # generate handlers for array splicing
+            map {
+                my $event_name = $_;
+
+                'on_' . $event_name => sub {
+                    my GenericViewer $v     = shift;
+                    my Array         $cells = shift;
+
+                    my $method_name = 'add_' . $event_name;
+                    $v->$method_name([ @{$cells}[ @$indexes ] ]);
+                }
+            } qw( header row ),
+        );
 };
 
 ########################################
@@ -246,30 +301,39 @@ multimethod dbh => qw(DBI::db $) => sub {
   my DBI::db $dbh = shift;
   my         $sql = shift;
 
-  return _simple
+  return publisher
     (sub {
        my GenericViewer $viewer = shift;
 
-       my DBI::st $sth = $dbh->prepare_cached( $sql );
+       my DBI::st $sth = $dbh->prepare( $sql );
        my $rows = $sth->execute();
-       return unless $rows > 0;
 
-       $viewer->add_header([ @{$sth->{'NAME'}} ]);
-       while ( my $row = $sth->fetchrow_arrayref() ) {
-	 $viewer->add_row( $row );
-       }
+       # transfer
+       PETL::DBI::statement( $sth )->( $viewer );
      });
 };
 
-# dbh query using dynamic query
+# dbh dbh, query using dynamic query
 multimethod dbh => qw(DBI::db CODE) => sub {
   my ($dbh, $dyna) = @_;
 
-  return _simple
-    (sub {
-       my GenericViewer $viewer = shift;
-       dbh( $dbh, &$dyna() )->( $viewer );
-     });
+  return publisher
+      ( sub {
+            my GenericViewer $viewer = shift;
+            dbh( $dbh, &$dyna() )->( $viewer );
+        });
+};
+
+# dbh callback, dynamic query
+multimethod dbh => qw(PETL::Connector CODE) => sub {
+    #_BREAK_HERE_;
+    my PETL::Connector  $get_dbh_cb = shift;
+    my Code             $dyna       = shift;
+
+    return publisher( sub {
+        my GenericViewer $v = shift;
+        dbh( &$get_dbh_cb, &$dyna )->( $v );
+    });
 };
 
 # dbh query using static query and arguments
@@ -281,45 +345,58 @@ multimethod dbh => qw( DBI::db  $ ARRAY ) => sub {
 
   my @arg_names = @$ra_arg_names;
   my $num_args = scalar @arg_names;
-  return _simple
-    ( sub {
-	my GenericViewer $viewer = shift;
+  return publisher( sub {
+      my GenericViewer $viewer = shift;
 
-	# throw exception if default hash doesn't have columns requested in the array
-	my @missing = grep !exists $_{$_}, @arg_names;
-	die "Requested columns ( @missing ) aren't present in outer context.\n"
+      # throw exception if default hash doesn't have columns requested in the array
+      my @missing = grep !exists $_{$_}, @arg_names;
+      die "Requested columns ( @missing ) aren't present in outer context.\n"
 	  if @missing;
 
-	my DBI::st $sth  = $dbh->prepare_cached( $sql );
-	my         $rows = $sth->execute( @_{@arg_names} );
-	return unless $rows;
+      my DBI::st $sth  = $dbh->prepare( $sql );
+      my         $rows = $sth->execute( @_{@arg_names} );
+      return unless $rows;
 
-	# transfer statement to viewer
-	_BREAK_HERE_;
-	PETL::DBI::statement( $sth )->( $viewer );
-      });
+      # transfer statement to viewer
+      PETL::DBI::statement( $sth )->( $viewer );
+  });
 };
 
-sub _appender {
-  # Accept an array of headers for left-most cells, and the row values
-  # for those same cells, and a downstream viewer.  Return a viewer
-  # that places the left header cells before the header received from
-  # the publisher, and the left cells before the cells received from
-  # the publisher
-  my ( $left_headers, $left_cells, $viewer ) = @_;
+# dbh CODE, query, ARRAY allows db connectino to be late binding and
+# used as inner part of cartesian product with argument names
+multimethod dbh => qw( PETL::Connector $ ARRAY ) => sub {
+    my PETL::Connector $connector = shift;
+    my                 $sql       = shift;
+    my Array           $fields    = shift;
 
-  return viewer
-    (
-     on_header => sub {
-       my ($ig, $header) = @_;
-       $viewer->add_header([ @$left_headers, @$header ]);
-     },
-     on_row    => sub {
-       my ($ig, $row   ) = @_;
-       $viewer->add_row   ([ @$left_cells  , @$row    ]);
-     },
-    );
-}
+    return publisher sub {
+        my GenericViewer $v = shift;
+        dbh( &$connector, $sql, $fields )->( $v );
+    };
+};
+
+# dbh CODE, query allows db connection to be late binding
+multimethod dbh => qw( PETL::Connector $ ) => sub {
+    my PETL::Connector $get_dbh_cb = shift;
+    my           $sql        = shift;
+
+    return publisher sub {
+        my GenericViewer $v = shift;
+        dbh( &$get_dbh_cb(), $sql )->( $v );
+    };
+};
+
+# dbh CODE, query, Publisher allows db connection to be late binding
+multimethod dbh => qw( PETL::Connector $ Publisher ) => sub {
+    my PETL::Connector $get_dbh_cb = shift; 
+    my           $sql        = shift; 
+    my Publisher $pub        = shift; 
+
+    return publisher sub {
+        my GenericViewer $v = shift;
+        dbh( &$get_dbh_cb(), $sql, $pub )->( $v );
+    };
+};
 
 # dbh query, usually insert or update, returns publisher that shows
 # number of records returned from the execute
@@ -328,36 +405,53 @@ multimethod dbh => qw( DBI::db $ Publisher ) => sub {
 
   # determine if query is from a SELECT statement and prepare the
   # query
-  my $is_select = $sql =~ /^\s*SELECT\b/i;
-  my $sth = $dbh->prepare_cached( $sql );
+  my $is_select = $sql =~ /^\s*SELECT\b/im;
+  my $sth = $dbh->prepare( $sql );
 
   # flag to indicate whether we've sent the header or not
   my $has_header = FALSE;
+  
+  # how to behave if SELECT statement
+  my $first;
+  my $select = publisher
+      (
+          publisher => $pub,
+          on_header => NO_HANDLER,
+          on_row    => sub {
+              my GenericViewer $v     = shift;
+              my               $cells = shift;
 
-  return _pub
-    (
-     publisher => $pub,
-     on_header => sub {},
-     on_row    => sub {
-       my ($v, $row) = @_;
-       my $num_rows = $sth->execute( @$row );
-       $num_rows += 0;
+              $first ||= _first( $v );
+              $sth->execute( @$cells );
+              PETL::DBI::statement( $sth )->( $first );
+          },
+          on_end    => sub {
+              $first = undef;
+          },
+      );
 
-       if ( $is_select ) {
-	 $DB::single = 1;
-	 PETL::DBI::statement( $sth )
-	     ->( _appender( ['rows'], [$num_rows], $v ) );
-       } 
-       else {
-	 unless( $has_header ) {
-	   $v->add_header([ 'rows' ]);
-	   $has_header = TRUE;
-	 }
-	 $v->add_row([ $num_rows ]);
-       }
+  # how to behave IF NOT a SELECT statment
+  my $not_select = publisher
+      (
+          publisher => $pub,
+          on_header => NO_HANDLER,
+          on_row    => sub {
+              my GenericViewer $v     = shift;
+              my               $cells = shift;
 
-     },
-    );
+              $first ||= _first( $v );
+              my $num_rows = $sth->execute( @$cells );
+
+              $first->add_header([ 'rows'    ]);
+              $first->add_row   ([ $num_rows ]);
+          },
+          on_end     => sub {
+              $first = undef;
+          },
+      );
+            
+  # return the correct publisher
+  return $is_select? $select: $not_select;
 };
 
 ########################################
@@ -373,6 +467,12 @@ sub define {
   my $func_name		= shift;
   my @define_args	= @_;
 
+  # if $new_keyword is fully qualified subroutine name then the string
+  # preceeding the last '::' is taken to be the pkg
+  if ( my ( $full_pkg, $keyword ) = $new_keyword =~ /^(.*)::(.*)/ ) {
+      ($pkg, $new_keyword) = ($full_pkg, $keyword);
+  }
+
   # throw exception if the  new_keyword is already defined
   die "Can't define an pre-existing definition for '$new_keyword'\n"
     if $pkg->can( $new_keyword );
@@ -386,11 +486,9 @@ sub define {
 
   # insert subroutine declaration into caller's namespace so
   # assignment below works correctly
-  # _BREAK_HERE_;
   my $sym = Symbol::qualify_to_ref( $new_keyword, $pkg );
 
   # save any existing references in the glob slots
-  # _BREAK_HERE_ 'x $sym';
   my $hr_saver = {};
   for my $slot (qw(SCALAR ARRAY HASH)) {
     # ignore undefined scalars
@@ -412,8 +510,6 @@ sub define {
   };
 
   # restore pre-existing slots
-  # _BREAK_HERE_ 'x $hr_saver';
-  #for my $slot ( keys %$hr_saver ) {
   while ( my ($slot, $ref) = each %$hr_saver ) {
     given ( $slot ) {
       when ( 'SCALAR' ) { ${*$sym{$slot}} = $$ref }
@@ -423,40 +519,92 @@ sub define {
   }
 
   # clear the references so garbage collection works
-  @{$hr_saver}{keys %$hr_saver} = (undef) x keys( %$hr_saver );
+  my @keys = keys %$hr_saver;
+  @{$hr_saver}{@keys} = (undef) x @keys;
 
   # clear the saver hash
   %$hr_saver = ();
 }
 
 ########################################
-# DELIMITED keyword
+# CLEAVE keyword
 ########################################
-multimethod delimited => qw($ Publisher) => sub {
+multimethod cleave => qw($ Publisher) => sub {
   # Accepts delimiter and a Publisher.  Returns a publisher that splits
   # the first column of the input publisher by the delimiter
   my $delimiter      = shift;
   my Publisher $pub  = shift;
 
-  my $has_header = FALSE;
-  return publisher
-    ( 
-     publisher => $pub,
-     on_header => sub {},
-     on_row    => sub {
-       my GenericViewer $v   = shift;
-       my               $row = shift;
+  return cleave( qr/$delimiter/, $pub );
+};
 
-       my $cells = [ split $delimiter, $row->[0] ];
-       unless ( $has_header ) {
-	 $has_header = ! $has_header;
-	 $v->add_header([ map sprintf('field%04d', $_), (0 .. $#$cells)]);
-       }
-       $v->add_row( $cells );
-     },
+multimethod cleave => qw(Regexp Publisher) => sub {
+    my Regexp    $regex = shift;
+    my Publisher $pub   = shift;
+
+
+    return auto_named( publisher
+        ( 
+            publisher => $pub,
+            on_header => NO_HANDLER,
+            on_row    => sub {
+                my GenericViewer $v   = shift;
+                my               $row = shift;
+                        
+                $v->add_row([ split /$regex/, $row->[0] ]);
+            },
+        )
     );
 };
 
+
+multimethod auto_named => qw(GenericViewer) => sub {
+    # accept a viewer, returns a viewer that will automatically name
+    # the fields using the pattern 'fields%03d' if add_row is invoked
+    # before add_header
+    my GenericViewer $v = shift;
+
+    my $has_header = FALSE;
+    my $count      = 0;
+    return viewer 
+        (
+            on_header => sub {
+                my GenericViewer $ig     = shift;
+                my Array         $header = shift;
+                
+                return if $has_header;
+                $has_header = TRUE;
+                $v->add_header( $header );
+            },
+            on_row    => sub {
+                my GenericViewer $ig     = shift;
+                my Array         $cells  = shift;
+
+                unless( $has_header ) {
+                    $has_header = TRUE;
+                    $v->add_header([ map { sprintf 'field%03d', $count++  } @$cells ]);
+                }
+                $v->add_row( $cells );
+            },
+        );
+};
+
+multimethod auto_named => qw(Publisher) => sub {
+    # Accept a publisher, returns a publisher that will automatically
+    # name the fields using the pattern 'field%03d' if add_row is
+    # invoked before add_header
+    my Publisher $pub = shift;
+
+    my $has_header = FALSE;
+    return publisher sub {
+        my GenericViewer $v = shift;
+        $pub->( auto_named( $v ) );
+    };
+};
+
+##############################################################################
+# DELIMITED keyword
+##############################################################################
 multimethod delimited => qw($ $ Publisher) => sub {
   # Accept a column delimiter, a row delimiter, and a Publisher.
   # Returns publisher that combines columns and rows into desired
@@ -465,23 +613,41 @@ multimethod delimited => qw($ $ Publisher) => sub {
   my $row_delimiter    = shift;
   my Publisher $pub    = shift;
 
+  my $num_cols;
+  my Code $reset_num_cols = sub {
+      $num_cols = undef;
+  };
   my Code $formatter = sub {
     my Array $row = shift;
-    return join( $column_delimiter, @$row ) . $row_delimiter;
+    $num_cols ||= scalar @$row;
+    return join( $column_delimiter, @{$row}[ 0 .. $num_cols-1 ] ) . $row_delimiter;
   };
 
   return publisher
     (
      publisher => $pub,
+     on_start  => $reset_num_cols,
+     on_end    => $reset_num_cols,
      on_header => sub {
        my GenericViewer $v   = shift;
        my Array         $row = shift;
+       $v->add_header([ $formatter->( $row ) ]);
      },
      on_row    => sub {
        my GenericViewer $v   = shift;
        my Array         $row = shift;
+       $v->add_row   ([ $formatter->( $row ) ]);
      },
     );
+};
+
+multimethod delimited => qw( $ Publisher ) => sub {
+    # Accepts column delimiter and a publisher
+    # returns a publisher that assumes the row delimiter is "\n"
+    my           $column_delimiter = shift;
+    my Publisher $pub              = shift;
+
+    return delimited( $column_delimiter, "\n", $pub );
 };
 
 ########################################
@@ -491,20 +657,19 @@ multimethod delimited => qw($ $ Publisher) => sub {
 multimethod every => qw(Publisher Publisher) => sub {
   my ($outside_pub, $inside_pub) = @_;
 
-  my $out = sub {
+  return publisher sub {
     my ($viewer) = @_;
 
     my (@fields, @values, @stack, @inner_header, $had_rows);
 
-    my $inner = _gv
+    my $inner = viewer
       (
        on_header => sub {
 	 my ($ig, $inner_header) = @_;
+         return if @inner_header;
 
-	 unless( @inner_header ) {
-	   @inner_header = @$inner_header;
-	   $viewer->add_header([ @fields, @inner_header ]);
-	 }
+         @inner_header = @$inner_header;
+         $viewer->add_header([ @fields, @inner_header ]);
        },
        on_row    => sub {
 	 my ($ig, $inner_row) = @_;
@@ -530,7 +695,7 @@ multimethod every => qw(Publisher Publisher) => sub {
        },
       );
 
-    my $outer = _gv
+    my $outer = viewer
       (
        on_header => sub {
 	 my ($ig, $outer_header) = @_;
@@ -573,8 +738,6 @@ multimethod every => qw(Publisher Publisher) => sub {
       $viewer->add_row([ @$row[0 .. $#fields] ]);
     }
   };
-
-  return _simple( $out );
 };
 
 # every with an ARRAY allows arbitrary nesting of publishers
@@ -589,7 +752,7 @@ multimethod every => qw(ARRAY) => sub {
   while( @pubs ) {
     if( $chain ) {
       # chain already defined, only add one link to existing chain
-      $chain = every( pop(@pubs), $chain );
+      $chain = every( pop(@pubs), cache( $chain ) );
     }
     else {
       # chain not defined, yank last two links off the list of pubs
@@ -636,7 +799,7 @@ multimethod expose => qw(Publisher) => sub {
 # columns
 multimethod fields => qw(ARRAY Publisher) => sub {
   my ($fields, $pub) = @_;
-  return _pub
+  return publisher
     ( on_header => sub {
 	my ($v, $header) = @_;
 	$v->add_header([ @$fields ]);
@@ -664,7 +827,7 @@ multimethod file => qw($ Publisher) => sub {
   my ($filename, $pub) = @_;
 
   my IO::File $handle;
-  return _pub
+  return publisher
     (
      # open output file for writing
      on_start => sub {
@@ -692,66 +855,125 @@ multimethod file => qw(IO::File Publisher) => sub {
   ($output_handle, $pub) = @_;
 
   my $num_rows;
-  return _simple
-    ( sub {
-	my GenericViewer $summary = shift;
+  return publisher sub {
+      my GenericViewer $summary = shift;
 
-	# initialize $num_rows to zero
-	$num_rows = 0;
+      # initialize $num_rows to zero
+      $num_rows = 0;
 
-	# send first column of each row to output handle, increment row
-	# count
-	$pub->( _gv(
-		    on_row => sub {
-		      my ($ignore, $row) = @_;
-		      $output_handle->print( $row->[0] );
-		      $num_rows++;
-		    },
-		   )
-	      );
+      # send first column of each row to output handle, increment row
+      # count
+      $pub->( 
+          viewer (
+              on_row => sub {
+                  my ($ignore, $row) = @_;
+                  $output_handle->print( $row->[0] );
+                  $num_rows++;
+              },
+          )
+      );
 
-	# write report of number of rows seen
-	column( 'rows', [$num_rows] )->( $summary );
-      }
-    );
+      # write report of number of rows seen
+      column( 'rows', [$num_rows] )->( $summary );
+  }
+};
+
+multimethod file => qw(CODE Publisher) => sub {
+    # file called with callback invokes the callback and delegates back to 'file' command
+    my Code      $cb  = shift;
+    my Publisher $pub = shift;
+
+    return publisher sub {
+        file( &$cb, $pub )->( @_ );
+    };
+};
+
+# file called with a code reference invokes the code reference and delegates to FILE
+multimethod file => qw(CODE) => sub {
+    my Code $cb = shift;
+
+    return publisher sub {
+        file( &$cb )->( @_ );
+    };
 };
 
 # file called with a string assumes string is a filename to be read
 multimethod file => qw($) => sub {
   my ($filename) = @_;
 
-  return _simple
-    ( sub {
-	my GenericViewer $v = shift;
+  return publisher sub {
+      my GenericViewer $v = shift;
 
-	# open the file to be read
-	my IO::File $input_handle = IO::File->new( $filename, 'r' )
+      # open the file to be read
+      my IO::File $input_handle = IO::File->new( $filename, 'r' )
 	  or die "Can't open file '$filename' for reading.\n";
 
-	# delegate reaading to file( IO::File ) and use filename as column name
-	fields( [$filename], file( $input_handle ) )->( $v );
-      }
-    );
+      # delegate reaading to file( IO::File ) and use filename as column name
+      fields( [$filename], file( $input_handle ) )->( $v );
+  };
 };
 
 # file called with a IO::File assumes input filehandle
-my $handle_num = 0;
 multimethod file => qw(IO::File) => sub {
-  my ($input_handle) = @_;
+    my IO::File $input_handle = shift;
 
-  return _simple
-    ( sub {
-	my GenericViewer $v = shift;
+    return publisher sub {
+        my GenericViewer $v = shift;
 
-	# output a constructed column name
-	$v->add_header([ 'IO::File' . sprintf( "%05d", $handle_num++ ) ]);
+        # output a constructed column name
+        $v->add_header([ sprintf( "IO::File#%05d", $input_handle->fileno ) ]);
 
-	# output the rows in a single column
-	while ( my $line = <$input_handle> ) {
-	  $v->add_row([ $line ]);
-	}
-      }
+        # output the rows in a single column
+        while ( my $line = <$input_handle> ) {
+            $v->add_row([ $line ]);
+        }
+    };
+};
+
+########################################
+# FILTER keyword
+########################################
+# act like perl's grep: accept a code ref and a publisher, return
+# publisher that only sends rows that generate 'true' value from the
+# coderef
+multimethod filter => qw(CODE Publisher) => sub {
+  my Code $predicate = shift;
+  my Publisher $pub  = shift;
+
+  return publisher
+    (
+     publisher => $pub,
+     on_row    => sub {
+       my GenericViewer $v   = shift;
+       my Array         $row = shift;
+
+       $v->add_row( $row )
+	 if $predicate->([ @$row ]);
+     },
     );
+};
+
+########################################
+# GO keyword
+########################################
+# similar to show/perform except only number of rows is returned
+multimethod go => qw(Publisher) => sub {
+    my Publisher $input = shift;
+
+    # create viewer to count rows
+    my $rows = 0;
+    my GenericViewer $counter = viewer
+        (
+            on_row => sub {
+                $rows++;
+            },
+            on_header => NO_HANDLER,
+        );
+
+    my $dur = _timeit( sub { $input->( $counter ) } );
+
+    STDOUT->say   ( 'Rows    : '      , $rows );
+    STDOUT->printf( "Duration: %.3f\n", $dur  );
 };
 
 ########################################
@@ -759,26 +981,26 @@ multimethod file => qw(IO::File) => sub {
 ########################################
 # accepts multiple publishers and glue their columns together
 sub glue {
-  my (@pubs) = @_;
+    my (@pubs) = @_;
 
-  return _pub
-    (
-     on_start => sub {
-       my ($viewer) = @_;
+    return publisher
+        (
+            on_start => sub {
+                my ($viewer) = @_;
 
-       # place publisher's output into an array of lols
-       my @lols = map lol($_), @pubs;
+                # place publisher's output into an array of lols
+                my @lols = map lol($_), @pubs;
        
-       # output composite header
-       $viewer->add_header([ map @{$_->[0]}, @lols ]);
+                # output composite header
+                $viewer->add_header([ map @{$_->[0]}, @lols ]);
 
-       # output all the rows
-       my $num_rows = List::Util::max( map( $#$_, @lols ) );
-       for my $row ( 1 .. $num_rows ) {
-	 $viewer->add_row([ map @{$_->[$row]||[]}[0..$#{$_->[0]}], @lols ]);
-       }
-     },
-    );
+                # output all the rows
+                my $num_rows = List::Util::max( map( $#$_, @lols ) );
+                for my $row ( 1 .. $num_rows ) {
+                    $viewer->add_row([ map @{$_->[$row]||[]}[0..$#{$_->[0]}], @lols ]);
+                }
+            },
+        );
 }
 
 ########################################
@@ -788,43 +1010,68 @@ sub glue {
 #
 # eg: $h_of_l = hol table [[a..b],[1..2],[3..4]]
 #
-#  $h_of_l => {
+#  $h_of_l =  {
 #               a => [1,3],
 #               b => [2,4],
 #             }
 multimethod hol => qw(Publisher) => sub {
-  my ($pub) = @_;
+    my ($pub) = @_;
 
-  # create container for result
-  my $hol = {};
+    # create container for result
+    my $hol = {};
 
-  my @fields;
-  $pub->
-    ( _gv( on_header => sub {
-	     my ($ig, $header) = @_;
+    my @fields;
+    $pub->
+        ( 
+            viewer( 
+                on_header => sub {
+                    my ($ig, $header) = @_;
 
-	     @fields = map {
-	       my $cp = $_;
-	       $cp =~ s/[^a-z0-9]/_/gi;
-	       $cp
-	     } @$header;
+                    @fields = map {
+                        my $cp = $_;
+                        $cp =~ s/[^a-z0-9]/_/gi;
+                        $cp
+                    } @$header;
 
-	     # create the slots
-	     @${hol}{@fields} = map [], @fields;
-	   },
-	   on_row    => sub {
-	     my ($ig, $row) = @_;
+                    # create the slots
+                    @${hol}{@fields} = map [], @fields;
+                },
+                on_row    => sub {
+                    my ($ig, $row) = @_;
+                    
+                    # push new value onto list in each slot
+                    for my $idx ( 0 .. $#fields ) {
+                        push @{$hol->{$fields[$idx]}}, $row->[$idx];
+                    }
+                },
+            )
+        );
 
-	     # push new value onto list in each slot
-	     for my $idx ( 0 .. $#fields ) {
-	       push @{$hol->{$fields[$idx]}}, $row->[$idx];
-	     }
-	   },
-	 )
-    );
+    # return results
+    return $hol;
+};
 
-  # return results
-  return $hol;
+# hol keyword given a hash assumes a hash of lists 
+multimethod hol => qw(HASH) => sub {
+    my Hash $hol = shift;
+
+    return publisher sub {
+        my GenericViewer $v = shift;
+
+        # do nothing unless there is at least one key
+        return unless keys %$hol;
+
+        # output header
+        $v->add_header([ 'key', 'entry' ]);
+        
+        while ( my ($key, $listref) = each %$hol ) {
+            next unless defined $listref;
+            next unless @{ $listref || [] };
+            for my $entry ( @$listref ) {
+                $v->add_row([ $key, $entry ]);
+            }
+        }
+    };
 };
 
 ########################################
@@ -850,21 +1097,20 @@ multimethod late => qw($) => sub {
 # loh called with an ARRAY returns a publisher over contents
 multimethod loh => ('ARRAY') => sub {
   my ($loh) = @_;
-  return _simple
-    (sub{
-       my ($viewer) = @_;
+  return publisher sub {
+      my GenericViewer $viewer = shift;
 
-       #- scan loh for distinct keys
-       my ($keys);
-       @{$keys}{map( keys(%$_), @$loh)} = ();
-       my @fields = keys %$keys;
-       $viewer->add_header( \@fields );
+      #- scan loh for distinct keys
+      my ($keys);
+      @{$keys}{map( keys(%$_), @$loh)} = ();
+      my @fields = keys %$keys;
+      $viewer->add_header( \@fields );
 
-       #- replay rows using the same pattern of columns
-       for my $row_hash ( @$loh ) {
-	 $viewer->add_row([ @{$row_hash}{@fields} ]);
-       }
-     });
+      #- replay rows using the same pattern of columns
+      for my $row_hash ( @$loh ) {
+          $viewer->add_row([ @{$row_hash}{@fields} ]);
+      }
+  };
 };
 
 # loh called with a Publisher returns a loh of the contents
@@ -872,18 +1118,22 @@ multimethod loh => ('Publisher') => sub {
   my ($pub) = @_;
   my $loh;
 
+  # have publisher write its contents into a viewer
   my @fields;
-  $pub->( _gv( on_header => sub {
-		 my ($ig, $header) = @_;
-		 @fields = @$header;
-	       },
-	       on_row    => sub {
-		 my ($ig, $row) = @_;
-		 my $href;
-		 @{$href}{@fields} = @$row;
-		 push @$loh, $href;
-	       },
-	     ));
+  $pub->( viewer
+              (
+                  on_header => sub {
+                      my ($ig, $header) = @_;
+                      @fields = @$header;
+                  },
+                  on_row    => sub {
+                      my ($ig, $row) = @_;
+                      my $href;
+                      @{$href}{@fields} = @$row;
+                      push @$loh, $href;
+                  },
+              )
+          );
 
   return $loh;
 };
@@ -901,7 +1151,7 @@ multimethod lol => ('Publisher') => sub {
     my ($ig, $cells) = @_;
     push @$lol, [ @$cells ];
   };
-  $pub->( _gv( on_header => $common, on_row    => $common, ) );
+  $pub->( viewer( on_header => $common, on_row    => $common, ) );
   return $lol;
 };
 
@@ -948,23 +1198,33 @@ multimethod long => ('Publisher') => sub {
 multimethod perform => ('Publisher') => sub {
   my ($pub) = @_;
 
-  my $before = Time::HiRes::time();
-  eval {
-    $pub->( _viewer() );
+  my Code $action = sub {
+      eval {
+          $pub->( _tabd() );
+      };
+      if( $@ ) {
+          STDERR->print( $@ );
+      }
   };
-  if( $@ ) {
-    STDERR->print( $@ );
-  }
-  my $after = Time::HiRes::time();
 
-  my $dur = $after - $before;
+  my $dur = _timeit $action;
+
   STDOUT->say( sprintf( "Duration: %.3f seconds.", $dur ) );
 };
 
 ########################################
 # PUBLISHER keyword
 ########################################
-sub publisher { _pub( @_ ) }
+multimethod publisher => qw( CODE ) => sub {
+    # publisher with a code reference returns a new Publisher::Simple
+    my Code $cb = shift;
+    return Publisher::Simple->new( $cb );
+};
+
+resolve_no_match publisher => sub {
+    # publisher with anything else is a synonym for _pub( @_ )
+    return Publisher->new( @_ );
+};
 
 ########################################
 # RANGE keyword
@@ -972,7 +1232,7 @@ sub publisher { _pub( @_ ) }
 # accept two numbers and publish integer values between them (like 'for')
 multimethod range => ('#', '#') => sub {
   my ($from, $to) = @_;
-  return _pub
+  return publisher 
     ( on_start => sub {
 	my ($v) = @_;
 	$v->add_header([ 'range' ]);
@@ -994,7 +1254,7 @@ multimethod regex => qw(Regexp Publisher) => sub {
 
   my Code $cb;
   my $has_header = 0;
-  return publisher
+  return auto_named publisher
     (
      publisher => $pub,
      on_header => sub {
@@ -1003,16 +1263,13 @@ multimethod regex => qw(Regexp Publisher) => sub {
        my GenericViewer $v      = shift;
        my Array         $row    = shift;
 
-       my Array $cells = [ $row->[0] =~ /$regex/ ];
+       # only output a row if there is a match
+       my @matched = $row->[0] =~ /$regex/;
+       return unless @matched > 0;
 
-       unless ( $has_header ) {
-	 # add a default header
-	 $has_header++;
-	 $v->add_header([ map sprintf( 'field%03d', $_ ), 0..$#$cells ]);
-       }
-      
+
        # send the captured sells as a row
-       $v->add_row( $cells );
+       $v->add_row( \@matched );
      },
     );
 };
@@ -1038,7 +1295,7 @@ multimethod table => ('ARRAY') => sub {
   # accept a list of lists and return a Publisher over those values
   my ($lol) = @_;
 
-  return _simple
+  return publisher
     (
      sub {
        my ($viewer) = @_;
@@ -1058,20 +1315,144 @@ multimethod table => ('ARRAY') => sub {
     );
 };
 
+sub one_header;
+multimethod one_header => qw(Publisher) => sub {
+    my Publisher $pub = shift;
+
+    my $has_header = FALSE;
+    return publisher
+        (
+            publisher => $pub,
+            on_start  => sub {
+                $has_header = FALSE;
+            },
+            on_header => sub {
+                my GenericViewer $v     = shift;
+                my               $cells = shift;
+                return if $has_header;
+                $has_header = TRUE;
+                $v->add_header( $cells );
+            },
+            on_row    => sub {
+                my GenericViewer $v     = shift;
+                my               $cells = shift;
+                $v->add_row   ( $cells );
+            },
+        );
+};    
+
+sub same_columns;
+multimethod same_columns => qw(Publisher) => sub {
+    my Publisher $pub = shift;
+
+    my $num_cols;
+    return publisher
+        (
+            publisher => $pub,
+            on_start  => sub {
+                $num_cols = undef;
+            },
+            on_header => sub {
+                my GenericViewer $v     = shift;
+                my               $cells = shift;
+                $num_cols = scalar @$cells;
+                $v->add_header( $cells );
+            },
+            on_row    => sub {
+                my GenericViewer $v     = shift;
+                my               $cells = shift;
+                $num_cols ||= scalar @$cells;
+                $v->add_row([ @{$cells}[ 0 .. $num_cols-1 ] ]);
+            },
+        );
+};
+
+########################################
+# UNION keyword
+########################################
+# serially combine output from one to many publishers
+sub union {
+    my @publishers = @_;
+
+    # send the output of each publisher in @publishers to viewer $v,
+    # ensuring that only one header and a consistent number of columns
+    # is sent
+    return same_columns one_header publisher sub {
+        my GenericViewer $v = shift;
+
+        for my Publisher $p ( @publishers ) {
+            $p->( $v );
+        }
+    };
+};
+
 ########################################
 # VIEWER keyword
 ########################################
 # syntactic sugar to return viewer
-sub viewer { _gv( @_ ) }
+sub viewer { GenericViewer->new( @_ ) }
 
 ##############################################################################
 # PRIVATE FUNCTIONS
 ##############################################################################
-sub _viewer {
+sub _appender {
+    # Accept:
+    # -   an array of headers for left-most cells
+    # -   a callback to retrieve the row values for those cells
+    # -   a downstream viewer.  
+    #
+    # Returns a viewer
+    # -  that places the left header cells before the header received from
+    # the publisher, and the left cells before the cells received from
+    # the publisher
+    my Array         $left_headers  = shift;
+    my Code          $left_cells_cb = shift;
+    my GenericViewer $viewer        = shift;
+
+    my $has_header = FALSE;
+
+    return viewer
+        (
+            on_header => sub {
+                my ($ig, $header) = @_;
+                $viewer->add_header([ @$left_headers, @$header ])
+                    unless( $has_header||=TRUE );
+            },
+            on_row    => sub {
+                my ($ig, $row   ) = @_;
+                $viewer->add_row   ([ @{ &$left_cells_cb || [] }  , @$row    ]);
+            },
+        );
+}
+
+sub _first {
+    # accepts viewer,  returns viewer that only propagates first header received
+    my GenericViewer $original = shift;
+
+    my $has_header = FALSE;
+    return viewer
+        (
+            on_header => sub {
+                my GenericViewer $self  = shift;
+                my               $cells = shift;
+
+                return if $has_header++;
+                $original->add_header([ @$cells ]);
+            },
+            on_row    => sub {
+                my GenericViewer $self  = shift;
+                my               $cells = shift;
+
+                $original->add_row([ @$cells ]);
+            },
+        );
+}
+
+sub _tabd {
   # return a viewer that outputs tab delimited
 
   my @columns;
-  return _gv
+  return viewer
     (
      on_header => sub {
        my ($ig, $header) = @_;
@@ -1085,26 +1466,27 @@ sub _viewer {
     );
 }
 
+sub _timeit {
+    # return the number of seconds taken to perform the callback
+    my Code $cb = shift;
+
+    my $before = Time::HiRes::time();
+    $cb->();
+    my $after  = Time::HiRes::time();
+
+    return $after - $before;
+}
+
 sub _BREAK_HERE_ { 
   # allow persistent debugger commands and breaks
   return unless IN_DEBUGGER;
 
   no warnings 'once';
   push @DB::typeahead, @_;
-  $DB::single = 1 
+  $DB::single = 1 ;
 }
 
-# syntactic sugar to return a GenericViewer
-sub _gv { GenericViewer->new( @_ ) }
-
-# syntactic sugar to return a Publisher
-sub _pub { Publisher->new( @_ ) }
-
-# syntactic sugar to return a Publisher::Simple
-sub _simple { Publisher::Simple->new( @_ ) }
-
 no Exporter;
-
 return __PACKAGE__;
 
 

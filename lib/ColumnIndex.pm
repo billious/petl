@@ -41,4 +41,47 @@ sub get_cb {
   };
 }
 
+sub get_omit_cb {
+    # returns a callback that will return all the fields EXCEPT the ones passed in
+    my ($self, @omit_fields) = @_;
+
+    my $cb;
+    return sub {
+        my ($ra_cells) = @_;
+
+        # generate the callback if necessary
+        unless ( $cb ) {
+            my $s  = $self;
+            my $rh = { %$s };
+            delete @{$rh}{ @omit_fields };
+            my @keep = sort { $s->{$a} <=> $s->{$b} }
+                keys %$rh;
+            $cb = $self->get_cb( @keep );
+        }
+
+        # execute the callback
+        return $cb->( $ra_cells );
+    };
+}
+
+my @tests;
+sub proof (&) {
+    push @tests, @_;
+}
+
+proof {
+    # TEST: get_omit_cb
+    my $ci    = __PACKAGE__->new;
+    my $no_b  = $ci->get_omit_cb( 'b' );
+    my $cells = [ 'a' .. 'c' ];
+    $ci->add_header( $cells );
+    Test::More::is_deeply( [ $no_b->( $cells ) ], [ 'a', 'c' ], 'should be able to omit columns by name' );
+};
+
+if( Test::More->can('ok') ) {
+    &$_ for @tests;
+    Test::More::done_testing();
+}
+
+
 1;

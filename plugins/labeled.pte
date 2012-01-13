@@ -1,0 +1,33 @@
+#! perl
+use PETL qw(:all);
+use Class::Multimethods;
+
+# declare PETL keywords
+sub cells;
+sub header;
+sub row;
+sub via (&$);
+sub target;
+
+multimethod labeled => qw(Publisher) => sub {
+    my Publisher $pub = shift;
+
+    # return publisher that displays first row of cells as the field names for the table
+    publisher sub {
+        my GenericViewer $v = shift;
+
+        my $filt = via {
+            if ( target()->has_header ) {
+                row cells;
+            }
+            else {
+                header cells;
+            }
+        } $pub;
+
+        $filt->( $v );
+    };
+};
+
+no warnings qw(void);
+__PACKAGE__;

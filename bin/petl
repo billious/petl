@@ -1,0 +1,178 @@
+#!/usr/bin/env perl -d
+use 5.10.0;
+use strict;
+use warnings;
+
+use Carp               ;
+use Class::Multimethods;
+use Cwd              ();
+use DirHandle          ;
+use File::Basename   ();
+use File::Spec       ();
+use File::Find       ();  no warnings 'File::Find';
+use List::MoreUtils  ();
+use Try::Tiny      qw( try catch finally );
+
+sub _BREAK_HERE_ {
+    no warnings 'once';
+    push @DB::typeahead, @_;
+    $DB::single = 1;
+}
+
+sub _DEBUGGER_ {
+    _BREAK_HERE_( @_, 'c' );
+}
+
+##############################################################################
+sub _dynaload_petl {
+    #  deduce path to lib/PETL.pm assuming lib is peer directory to
+    # bin/petl, and attempt to dynamically load the library
+    my ($name, $path, $suffix) = File::Basename::fileparse
+        ( Cwd::abs_path( $0 ) );
+    my $lib_path = File::Spec->rel2abs( '../lib', $path );
+    eval qq(use lib '$lib_path');
+    eval qq(use PETL ':all');
+
+    our $PETL_PATH = $path;
+
+    # PETL should now be loaded.  Die unless PETL->can('perform')
+    croak( "Couldn't locate PETL library\n" )
+        unless PETL->can( 'perform' );
+}
+
+sub _execute_petl_scripts {
+    # exit if there were arguments
+    _BREAK_HERE_( 'q' ) if @ARGV;
+
+    # execute any arguments
+    for my $file ( @ARGV ) {
+        # ensure the argument is a readable file
+        unless ( -f( $file ) and -r( $file ) ) {
+            carp( "Argument $file is not a readable file." );
+            next;
+        }
+
+        # execute the script
+        try { 
+            do $file;
+        } catch {
+            STDERR->say( $_ );
+        };
+    }
+}
+
+BEGIN {
+    # try to enable readline debugger support
+    eval {require Term::ReadLine::Perl};
+
+    # allocate lists to hold names of @loaded and @failed extensions
+    my @loaded;
+    my @failed;
+
+    sub _get_loaded { @loaded }
+    sub _get_failed { @failed }
+
+    sub plugin_status {
+        # return a PETL publisher of the plug-ins and their status
+        my @fields = qw( status plug-ins );
+
+        return choose
+            ( [ reverse @fields ],
+              fields
+                  ( [ @fields         ],
+                    hol
+                        (
+                            {
+                                loaded => [ _get_loaded() ],
+                                failed => [ _get_failed() ],
+                            } 
+                        )
+                    )
+              );
+    }
+
+    my $rh_loaded = {};
+    sub _load_petl_extensions {
+        # load petl extension files that may exist in a directory. petl
+        # extension file content is frankly perl source with the extension
+        # '.pte' that should establish new keywords and symbols
+        my $dir = shift;
+
+        my $dh = DirHandle->new( $dir );
+        while ( my $file = $dh->read ) {
+            $file = File::Spec->catfile( $dir, $file );
+
+            # we want readable .pte files that haven't been loaded
+            next unless -f $file;
+            next unless -r $file;
+            next unless $file =~ /\.pte$/;
+            next if     $rh_loaded->{$file}++;
+
+            my $is_loaded = 0;
+            try {
+                $is_loaded = do $file;
+            };
+
+            push @{ $is_loaded? \@loaded: \@failed }, $file;
+        }
+    }
+}
+
+sub _petl_path {
+    # return a list of the directories in 'PETL_PATH' or the default
+
+    # calculate the PETL search path
+    my $HOME        =   $ENV{'HOME'     };
+    my $petl_search =   $ENV{'PETL_PATH'};
+    $petl_search    ||= join ':', 
+        (
+            $HOME,
+            File::Spec->catfile( $HOME, '.petl' ),
+            (our $PETL_PATH),
+            '.petl'
+        );
+
+    # return uniq fully qualified directories found in PETL_PATH (or default)
+    return grep -d, 
+        List::MoreUtils::uniq
+              map Cwd::abs_path( $_ ), 
+                  split ':', $petl_search;
+}
+
+sub extend_petl {
+    # allow extensions to extend petl use Class::Multimethods
+    #
+    # simple wrapper delegates call to Class::Multimethods
+    Class::Multimethods::multimethod( @_ );
+}
+
+sub _report_status {
+    # Output report of extension load status using PETL constructs
+    return show( aa( plugin_status() ) );
+}
+
+BEGIN {
+    # if PETL can't be found in @INC invoke _dynaload_petl
+    _dynaload_petl() unless eval { 
+        require PETL;
+        PETL->import( ':all' );
+    };
+
+    # load petl extensions in a path
+    _load_petl_extensions( $_ ) for _petl_path();
+
+    # execute any scripts provided as arguments to command line
+    _execute_petl_scripts();
+
+    # report status
+    _report_status();
+}
+
+# display initial prompt
+no warnings;
+<<'MESSAGE' 
+Enter perl debugger or PETL commands.  Try 'help'.  'q' to quit.
+
+MESSAGE
+
+__END__

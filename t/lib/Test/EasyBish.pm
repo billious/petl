@@ -7,68 +7,110 @@ use Exporter qw(import);
 use Test::More;
 
 # faux package to allow "my Code $ref" declaration
-@Code::ISA = qw(CODE);
+{
+    no warnings 'once';
+    @Code::ISA = qw(CODE);
+}
 
 # we export three subroutines as well as those exported by Test::More
 our @EXPORT = qw
-  (
-    required_modules
-    scenario
-    title
-  );
+    (
+        required_modules
+        scenario
+        title
+);
 push @EXPORT, @Test::More::EXPORT;
 
 # Test and title storage
 my @tests;
 my @titles;
+my $current;
 
 # predeclarations
 sub scenario (&);
 
 sub get_num_tests {
-  # return the number of defined tests
-  return scalar @tests;
+    # return the number of defined tests
+    return scalar @tests;
 }
 
 sub required_modules {
-  # add a use_ok scenario for each module
-  for my $module ( @_ ) {
-    scenario { use_ok( $module ) };
-  }
+    # add a use_ok scenario for each module
+    for my $module ( @_ ) {
+        scenario { use_ok( $module ) };
+        title( "$module module available and compiles" );
+    }
 }
 
 sub run_tests {
-  # execute the tests
-  for my $test_code ( @tests ) {
-    &$test_code();
-  }
+    # execute the tests -- use shared package variable '$current' to
+    # reference the test
+    for $current ( @tests ) {
+        &$current();
+    }
 }
 
 sub scenario (&) {
-  my Code $callback = shift;
-  push @tests, $callback;
+    # define and register a test
+    my Code $callback = shift;
+    push @tests, Test::EasyBish::Scenario->new( $callback );
+    $current = $tests[-1];
 }
 
 sub title {
-  # access or modify the title of the current scenario
-  if( @_ ) {
-    $titles[ $#tests ] = shift;
-    return;
-  }
-  else {
-    return $titles[ $#tests ];
-  }
+    # access or modify the title of the current scenario
+    return $current->title( @_ );
 }
 
 END {
-  # register the number of tests to run
-  Test::More::plan( tests => get_num_tests() );
+    # register the number of tests to run
+    Test::More::plan( tests => get_num_tests() );
 
-  # run the tests
-  run_tests();
+    # run the tests
+    run_tests();
 
-  # complete testing
-  done_testing( get_num_tests() );
+    # complete testing
+    done_testing( get_num_tests() );
+}
+
+1;
+
+  ########################################
+ ##
+### Test::EasyBish::Scenario
+###
+###    inner class to hold Scenario attibutes
+###
+##########################################
+##
+#
+package Test::EasyBish::Scenario;
+use Scalar::Util ();
+
+my %title_for;
+
+my $refaddr = Scalar::Util->can( 'refaddr' );
+
+sub new {
+    my $invc          = shift;
+    my Code $callback = shift;
+
+    my $package = ref( $invc ) || $invc;
+    my $self =  bless $callback => $package;
+    $self->title( 'unspecified' );
+    return $self;
+}
+
+sub title {
+    my $self = shift;
+
+    # setter
+    if( @_ ) {
+        $title_for{ &$refaddr( $self ) } = shift;
+        return;
+    }
+
+    return $title_for{ &$refaddr( $self ) };
 }
 
 __PACKAGE__;

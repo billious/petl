@@ -1,0 +1,22 @@
+#!/usr/bin/perl 
+use strict;
+use warnings;
+
+use Class::Multimethods;
+
+sub viewer;
+
+# LIST keyword
+# list( Publisher ) returns first column of publisher as a list
+multimethod list => qw(Publisher) => sub {
+    my Publisher $pub = shift;
+
+    my @list;
+    my $common = sub {
+        my ($ig, $cells) = @_;
+        push @list, @{$cells}[0];
+    };
+    $pub->( viewer( on_header => $common, on_row => $common ) );
+    return @list;
+};
+

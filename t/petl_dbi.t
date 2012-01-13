@@ -51,7 +51,7 @@ scenario
 
 scenario 
   {
-    title( 'db handle accepts rows from a publisher as bind values for insert' );
+    title( 'db handle accepts rows from a publisher as bind values for INSERT' );
 
     # scenario: given a dbh handle, a table, and a SQL insert statement,
     # verify columns are bound when a table is the last argument on the right side of the db statement.
@@ -79,7 +79,7 @@ scenario
 
 scenario 
   {
-    title( 'db handle accepts rows from a publisher as bind values for select' );
+    title( 'db handle accepts rows from a publisher as bind values for SELECT' );
 
     # scenario: given a dbh handle, a table, a SQL select statement,
     # and a publisher verify that columns from the publisher are
@@ -104,7 +104,7 @@ scenario
     lol db $dbh, 'INSERT INTO primes VALUES (?, ?)', $primes_pub;
 
     # invoke SQL for every row in $primes_pub, and gather results into $output_lol
-    my $output_lol = lol db $dbh, 'SELECT prime_number FROM primes WHERE sequence = ?', 
+    my $output_lol = lol db $dbh, 'SELECT sequence, prime_number FROM primes WHERE sequence = ?', 
       choose ['sequence'], $primes_pub;
 
     # perform the test comparing $output_lol with $primes_lol
@@ -123,55 +123,3 @@ sub get_anydata_dbh {
   return DBI->connect( 'dbi:AnyData(RaiseError=>1):' );
 }
 
-##############################################################################
-# Life cycle handlers
-##############################################################################
-# {
-#   my @tests;
-#   my @titles;
-#   sub scenario (&) {
-#     my Code $cb = shift;
-#     push @tests, $cb;
-#   }
-
-#   sub title {
-#     # access or modify the title of the current scenario
-#     if( @_ ) {
-#       $titles[ $#tests ] = shift;
-#       return;
-#     }
-#     return $titles[ $#tests ];
-#   }
-
-#   sub get_num_tests {
-#     # retrieve the number of tests 
-#     return scalar @tests;
-#   }
-
-#   sub run_tests {
-#     # run the tests
-#     for my $test ( @tests ) {
-#       try { &$test() };
-#     }
-#   }
-
-#   sub required_modules {
-#     # add a test to verify each module can be used
-#     my @needed = @_;
-
-#     for my $module ( @needed ) {
-#       scenario( sub { use_ok( $module ) } );
-#     }
-#   }
-# }
-
-# END {
-#   # register the number of tests to run
-#   Test::More::plan( tests => get_num_tests() );
-
-#   # run the tests
-#   run_tests();
-
-#   # complete testing
-#   done_testing( get_num_tests() );
-# }

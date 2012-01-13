@@ -1,8 +1,9 @@
 package GenericViewer;
 
 use strict;
-use constant ON_HEADER => 0;
-use constant ON_ROW    => 1;
+use constant ON_HEADER  => 0;
+use constant ON_ROW     => 1;
+use constant HAS_HEADER => 2;
 
 sub new {
   my $invc = shift;
@@ -13,20 +14,28 @@ sub new {
      @_
     );
 
-  my $self = [ @params{'on_header', 'on_row'} ];
+  my $self = [ @params{'on_header', 'on_row'}, 0 ];
   return bless $self => (ref $invc || $invc);
 }
 
 sub add_header {
   # delegate header to registered handler
   my( $self, $ra_header ) = @_;
+  return if $self->has_header;
   $self->[ON_HEADER]->( $self, $ra_header );
+  $self->[HAS_HEADER] = 1;
 }
 
 sub add_row {
   # delegate row to registered handler
   my( $self, $ra_row ) = @_;
   $self->[ON_ROW]->( $self, $ra_row );
+}
+
+sub has_header {
+    # return boolean whether we've accepted a header
+    my $self = shift;
+    return $self->[HAS_HEADER];
 }
 
 sub set_on_header {
