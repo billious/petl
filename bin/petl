@@ -1,7 +1,9 @@
-#!/usr/bin/env perl -d
-use 5.10.0;
+#!/usr/bin/env -S perl -d
+use 5.22.0;
 use strict;
 use warnings;
+
+use lib::relative '../lib';
 
 use Carp               ;
 use Class::Multimethods;
@@ -25,6 +27,23 @@ sub _DEBUGGER_ {
 
 ##############################################################################
 sub _dynaload_petl {
+    # if current package can 'perform' then PETL is loaded, return
+    #_BREAK_HERE_;
+    return
+        if __PACKAGE__->can('perform');
+
+    # if PETL can 'perform' then the current package just needs to import
+    # all the symbols
+    if( PETL->can('import') and PETL->can('perform') ) {
+        PETL->import(':all');
+        return;
+    }
+
+    _BREAK_HERE_;
+    my $message = "some trouble with importing PETL symbols";
+}
+
+sub _5_10_0_dynaload_petl {
     #  deduce path to lib/PETL.pm assuming lib is peer directory to
     # bin/petl, and attempt to dynamically load the library
     my ($name, $path, $suffix) = File::Basename::fileparse

@@ -45,6 +45,7 @@ our @EXPORT_OK =
       filter
       glue
       go
+      help
       hol
       late
       loh
@@ -103,6 +104,7 @@ sub _timeit;
 ########################################
 # AUTO_ALIGNED keyword
 ########################################
+sub auto_aligned;
 multimethod auto_aligned => qw( Publisher ) => sub {
     # accept publisher and return publisher that automatically aligns
     # columns by width
@@ -132,10 +134,15 @@ multimethod auto_aligned => qw( Publisher ) => sub {
 
               # how table is constructed with the format
               my $row_count = 0;
+              my $num_columns;
               my $out = publisher
                   ( publisher => $res,
                     on_header => sub {
                         my ($v, $header) = @_;
+
+                        # remember the number of columns
+                        $num_columns ||= scalar(@$header);
+
                         # format column names
                         $v->add_header([ sprintf( $format, @$header ) ]);
 
@@ -146,11 +153,12 @@ multimethod auto_aligned => qw( Publisher ) => sub {
                     on_row    => sub {
                         my ($v, $row) = @_;
                         $row_count++;
-                        $v->add_row([ sprintf( $format, @$row ) ]);
+                        my $row_dup =  [ @{$row}[0 .. $num_columns-1] ];
+                        $v->add_row([ sprintf( $format, @$row_dup ) ]);
                     }, 
                     on_end   => sub {
                         my GenericViewer $v = shift;
-              
+
                         $v->add_row([ $_ ]) for ( '', "Rows received: $row_count" );
                     },
                 );
@@ -168,6 +176,7 @@ sub aa { &auto_aligned(@_) }
 # CACHE keyword
 ########################################
 # cache results from publisher
+sub cache;
 multimethod cache => ('Publisher') => sub {
   # first invocation of returned Publisher
   my Publisher $pub = shift;
@@ -189,6 +198,7 @@ multimethod cache => ('Publisher') => sub {
 ########################################
 # CHOMPED keyword
 ########################################
+sub chomped;
 multimethod chomped => qw(Publisher) => sub {
   # perform 'chomp' on the first column of each row
   my Publisher $pub = shift;
@@ -210,6 +220,7 @@ multimethod chomped => qw(Publisher) => sub {
 # CHOOSE keyword
 ########################################
 # choose columns from publisher
+sub choose;
 multimethod choose => qw(ARRAY Publisher) => sub {
   my $ra_columns	= shift;
   my Publisher $pub	= shift;
@@ -245,6 +256,7 @@ multimethod choose => qw($ Publisher) => sub {
 # COLUMN keyword
 ########################################
 # column with a name and list reference is a one column table
+sub column;
 multimethod column => qw($ ARRAY) => sub {
   my ($column_name, $ra_values) = @_;
   return publisher
@@ -264,6 +276,7 @@ multimethod column => qw($ ARRAY) => sub {
 ########################################
 # choose column(s) by index instead of 
 # name
+sub columns;
 multimethod columns => qw(ARRAY Publisher) => sub {
     my Array     $indexes = shift;
     my Publisher $pub     = shift;
@@ -297,6 +310,7 @@ sub db { &dbh }
 # DBH keyword
 ########################################
 # dbh query using static query
+sub dbh;
 multimethod dbh => qw(DBI::db $) => sub {
   my DBI::db $dbh = shift;
   my         $sql = shift;
@@ -459,6 +473,8 @@ multimethod dbh => qw( DBI::db $ Publisher ) => sub {
 ########################################
 # define act => 'dbh', $dbh;
 sub define {
+  use experimental 'switch';
+
   # install a new subroutine in the caller's namespace that invokes
   # the named subroutine with the arguments supplied as well as
   # arguments that are supplied when the new subroutine is invoked
@@ -529,6 +545,7 @@ sub define {
 ########################################
 # CLEAVE keyword
 ########################################
+sub cleave;
 multimethod cleave => qw($ Publisher) => sub {
   # Accepts delimiter and a Publisher.  Returns a publisher that splits
   # the first column of the input publisher by the delimiter
@@ -557,7 +574,7 @@ multimethod cleave => qw(Regexp Publisher) => sub {
     );
 };
 
-
+sub auto_named;
 multimethod auto_named => qw(GenericViewer) => sub {
     # accept a viewer, returns a viewer that will automatically name
     # the fields using the pattern 'fields%03d' if add_row is invoked
@@ -605,6 +622,7 @@ multimethod auto_named => qw(Publisher) => sub {
 ##############################################################################
 # DELIMITED keyword
 ##############################################################################
+sub delimited;
 multimethod delimited => qw($ $ Publisher) => sub {
   # Accept a column delimiter, a row delimiter, and a Publisher.
   # Returns publisher that combines columns and rows into desired
@@ -654,6 +672,7 @@ multimethod delimited => qw( $ Publisher ) => sub {
 # EVERY keyword
 ########################################
 # every loop for two publishers
+sub every;
 multimethod every => qw(Publisher Publisher) => sub {
   my ($outside_pub, $inside_pub) = @_;
 
@@ -775,6 +794,7 @@ multimethod every => qw(ARRAY) => sub {
 #     #   @a = (1,4)
 #     #   @b = (2,5)
 #     #   @c = (3,6)
+sub expose;
 multimethod expose => qw(Publisher) => sub {
   my ($pub) = @_;
 
@@ -797,6 +817,7 @@ multimethod expose => qw(Publisher) => sub {
 ########################################
 # fields called with ARRAY, Publisher returns Publisher with renamed
 # columns
+sub fields;
 multimethod fields => qw(ARRAY Publisher) => sub {
   my ($fields, $pub) = @_;
   return publisher
@@ -816,12 +837,13 @@ multimethod fields => qw(ARRAY Publisher) => sub {
 # string of fields
 multimethod fields => qw($ Publisher) => sub {
   my ($fields_string, $pub) = @_;
-  fields( [ split ' ', $fields_string ], $pub );
+  fields( [ split /\s+/, $fields_string ], $pub );
 };
 
 ########################################
 # FILE keyword
 ########################################
+sub file;
 multimethod file => qw($ Publisher) => sub {
   # write contents of Publisher rows to filename
   my ($filename, $pub) = @_;
@@ -936,6 +958,7 @@ multimethod file => qw(IO::File) => sub {
 # act like perl's grep: accept a code ref and a publisher, return
 # publisher that only sends rows that generate 'true' value from the
 # coderef
+sub filter;
 multimethod filter => qw(CODE Publisher) => sub {
   my Code $predicate = shift;
   my Publisher $pub  = shift;
@@ -1002,6 +1025,15 @@ sub glue {
             },
         );
 }
+
+########################################
+# HELP keyword
+########################################
+# display list of available commands
+sub help {
+   eval q{show aa column 'keyword', \@EXPORT_OK};
+}
+
 
 ########################################
 # HOL keyword
@@ -1232,7 +1264,7 @@ resolve_no_match publisher => sub {
 # accept two numbers and publish integer values between them (like 'for')
 multimethod range => ('#', '#') => sub {
   my ($from, $to) = @_;
-  return publisher 
+  return publisher
     ( on_start => sub {
 	my ($v) = @_;
 	$v->add_header([ 'range' ]);

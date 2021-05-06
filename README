@@ -8,3 +8,4 @@ Moose
 Sub::Name
 Throwable
 Try::Tiny
+lib::relative
